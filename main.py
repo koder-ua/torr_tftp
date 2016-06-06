@@ -1,322 +1,47 @@
+"""
+TFTP main module
+"""
+
 from __future__ import print_function
 
+import os
 import sys
 import time
-import heapq
+import mmap
 import select
 import socket
 import random
-import os.path
 import logging
 import argparse
+import warnings
 import functools
-import collections
 
 
 def make_console_logger(name, level=logging.DEBUG):
     logger = logging.getLogger(name)
     logger.setLevel(level)
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
+    console_h = logging.StreamHandler()
+    console_h.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s - %(name)10s - %(levelname)6s - %(message)s')
+    console_h.setFormatter(formatter)
+    logger.addHandler(console_h)
     return logger
 
 
-proto_logger = make_console_logger('proto')
+make_console_logger('proto')
 main_logger = make_console_logger('main')
-tor_logger = make_console_logger('tor')
+make_console_logger('reactor')
 
 
-class PacketTypes(object):
-    RRQ = 1
-    WRQ = 2
-    DATA = 3
-    ACK = 4
-    ERROR = 5
-    INFO = 206
-
-
-class Errors(object):
-    NOT_DEFINED = (0, "Not defined, see error message (if any)")
-    NOT_FOUND = (1, "File not found")
-    ACCESS_VIOLATION = (2, "Access violation")
-    DISK_FULL = (3, "Disk full or allocation exceeded")
-    ILLIGAL_OPERATION = (4, "Illegal TFTP operation")
-    UNKNOWN_PORT = (5, "Unknown transfer ID")
-    FILE_EXISTS = (6, "File already exists")
-    NO_SUCH_USER = (7, "No such user")
-    MAX_RETRY_EXCEEDED = (100, "Max retry count exceeded")
-
-
-def net2int(data):
-    assert len(data) == 2
-    return ord(data[0]) * 256 + ord(data[1])
-
-
-def int2net(val):
-    assert val > 0 and val < 256 * 256
-    return chr(val // 256) + chr(val % 256)
-
-
-def parse_packet(data):
-    opcode = net2int(data[:2])
-    if opcode == PacketTypes.RRQ or opcode == PacketTypes.WRQ:
-        name, mode, empty = data[2:].split("\x00")
-        assert mode in ("netascii", "octet")
-        assert empty == ''
-        return opcode, (name, mode)
-    elif opcode == PacketTypes.DATA:
-        pos = net2int(data[2:4])
-        file_data = data[4:]
-        assert len(file_data) <= 512
-        return opcode, (pos, file_data)
-    elif opcode == PacketTypes.ACK:
-        assert len(data) == 4
-        return opcode, (net2int(data[2:]),)
-    elif opcode == PacketTypes.ERROR:
-        code = net2int(data[2:4])
-        message = data[4:-2]
-        assert data[-1] == '\x00'
-        return opcode, (code, message)
-    elif opcode == PacketTypes.INFO:
-        return opcode, (data[2:].split("\x00")[:-1],)
-    raise AssertionError("Unknown opcode {}".format(opcode))
-
-
-def make_responce(code, *params):
-    res = int2net(code)
-    if code == PacketTypes.DATA:
-        assert len(params) == 2
-        assert isinstance(params[0], int)
-        assert isinstance(params[1], str)
-        assert len(params[1]) <= 512
-        return res + int2net(params[0]) + params[1]
-
-    for i in params:
-        if isinstance(i, int):
-            res += int2net(i)
-        else:
-            assert isinstance(i, str)
-            if code == PacketTypes.DATA:
-                res += i
-                assert len(params) == 2
-            res += i + '\x00'
-    return res
-
-
-def get_file_info(fname):
-    return fname
-
-
-def get_file_mm_read(fname, boffset=None, eoffset=None):
-    pass
-
-
-def get_file_mm_write(fname, boffset=None, eoffset=None):
-    pass
-
-
-def clear_tempo_mm(mm):
-    pass
-
-
-def save_tempo_mm(mm):
-    pass
-
-
-class TFTPproto(object):
-    max_retry_count = 3
-    transfer_block_size = 512
-    offset_separator = "::"
-    timeout = 1
-
-    def __init__(self, fileobj, result_cb=None, err_callback=None):
-        self.mm = None
-        self.pos = None
-        self.retry_count = None
-        self.boffset = None
-        self.eoffset = None
-        self.last_packet = None
-        self.result_cb = result_cb
-        self.err_callback = err_callback
-        self.write_file = False
-        self.fileobj = fileobj
-
-    def close(self, err, data=None):
-        if err:
-            if self.write_file:
-                clear_tempo_mm(self.mm)
-            if self.err_callback is not None:
-                self.err_callback(data)
-        else:
-            if self.write_file:
-                save_tempo_mm(self.mm)
-            if self.result_cb is not None:
-                self.result_cb(data)
-
-    def init_read(self, rpath, boffset=None, eoffset=None, legacy_server=False):
-        assert (boffset is None) ^ (eoffset is None)
-        if boffset is not None and not legacy_server:
-            rpath = self.offset_separator.join(
-                [rpath, str(boffset), str(eoffset)])
-
-        self.boffset = boffset
-        self.eoffset = eoffset
-        self.pos = 0
-        self.mm = get_file_mm_read(fname)
-        self.last_packet = make_responce(PacketTypes.RRQ, rpath, 'octet')
-        return self.recv_file, self.last_packet
-
-    def init_write(self, rpath, lpath, boffset=None, eoffset=None):
-        self.pos = 0
-        raise NotImplementedError()
-
-    def get_info(self, fname):
-        return self.on_done, make_responce(PacketTypes.INFO, fname)
-
-    def parse_filepath_and_sanitize(self, path, write=False):
-        name_and_params = path.split(self.offset_separator)
-
-        if len(name_and_params) == 1:
-            fname, boffset, eoffset = name_and_params[0], None, None
-        else:
-            assert len(name_and_params) == 3
-            fname, boffset, eoffset = name_and_params
-            boffset = int(boffset)
-            eoffset = int(eoffset)
-
-        assert '/' not in fname
-        fpath = os.path.join(self.root, path)
-
-        return fpath, boffset, eoffset
-
-    def init_packet(self, packet):
-        code, params = parse_packet(packet)
-
-        if code == PacketTypes.RRQ:
-            fname, mode = params
-            fname, self.boffset, self.eoffset = self.parse_and_sanitize(fname)
-            self.mm = get_file_mm_read(fname)
-
-            if self.boffset is None:
-                self.boffset = 0
-                self.eoffset = self.mm.size()
-
-            assert self.boffset < self.eoffset <= self.mm.size()
-
-            self.pos = 1
-            self.retry_count = 0
-            return self.send_next_block()
-
-        elif code == PacketTypes.WRQ:
-            fname, mode = params
-            fname, boffset, eoffset = self.parse_and_sanitize(fname)
-
-            assert boffset is None
-            assert eoffset is None
-
-            self.mm = get_file_mm_write(fname)
-            self.write = True
-
-            self.retry_count = 0
-            self.pos = 1
-            self.last_packet = make_responce(PacketTypes.ACK, 0)
-            return self.recv_file, self.last_packet
-        elif code == PacketTypes.ERROR:
-            return self.close(True, params)
-        elif code == PacketTypes.INFO:
-            if len(params) == 0:
-                res = make_responce(PacketTypes.INFO)
-                self.close(False)
-                return None, res
-            elif len(params) == 1:
-                res = make_responce(PacketTypes.INFO, get_file_info(params[0]))
-                self.close(False)
-                return None, res
-
-        res = make_responce(PacketTypes.ERROR, *Errors.ILLIGAL_OPERATION)
-        self.close(True, Errors.ILLIGAL_OPERATION)
-        return None, res
-
-    def send_next_block(self):
-        curr_offset = self.boffset * (self.pos - 1) * self.transfer_block_size
-
-        if self.end_offset is not None:
-            rsize = min(self.transfer_block_size, self.end_offset - curr_offset)
-        else:
-            rsize = self.transfer_block_size
-
-        self.last_packet = make_responce(PacketTypes.DATA, self.pos,
-                                         self.mm[curr_offset:curr_offset + rsize])
-        return self.on_send_ack, self.last_packet
-
-    def on_send_ack(self, packet):
-        if packet is None:
-            # timeout
-            if self.retry_count == self.max_retry_count:
-                self.close(True, self.MAX_RETRY_EXCEEDED)
-                return None, None
-
-            self.retry_count += 1
-            return self.on_send_ack, self.last_packet
-
-        code, params = parse_packet(packet)
-
-        if code == PacketTypes.ACK:
-            self.retry_count = 0
-            if self.pos - 1 == params[0]:
-                return self.send_file, self.last_packet
-
-            assert self.pos == params[0]
-            self.pos += 1
-            return self.send_next_block()
-        elif code == PacketTypes.ERROR:
-            self.close(True, params)
-            return None, None
-
-        res = make_responce(PacketTypes.ERROR, *Errors.ILLIGAL_OPERATION)
-        self.close(True, Errors.ILLIGAL_OPERATION)
-        return None, res
-
-    def recv_file(self, packet):
-        if packet is None:
-            # timeout
-            if self.retry_count == self.max_retry_count:
-                self.close(True, self.MAX_RETRY_EXCEEDED)
-                return None, None
-
-            self.retry_count += 1
-            return self.recv_file, self.last_packet
-
-        code, params = parse_packet(packet)
-
-        if code == PacketTypes.DATA:
-            self.retry_count = 0
-            if self.pos == params[0]:
-                return self.recv_file, self.last_packet
-
-            assert self.pos + 1 == params[0]
-            self.pos = params[0]
-            data = params[1]
-            curr_offset = self.boffset * (self.pos - 1) * self.transfer_block_size
-            self.mm[curr_offset:curr_offset + len(data)] = data
-            self.last_packet = make_responce(PacketTypes.ACK, self.pos)
-
-            if (len(data) < self.transfer_block_size) or \
-               (self.eoffset is not None and curr_offset + len(data) >= self.eoffset):
-                self.close(False)
-                return None, self.last_packet
-
-            return self.recv_file, self.last_packet
-        elif code == PacketTypes.ERROR:
-            self.close(True, params)
-            return None, None
-
-        res = make_responce(PacketTypes.ERROR, *Errors.ILLIGAL_OPERATION)
-        self.close(True, Errors.ILLIGAL_OPERATION)
-        return None, res
+from tftp_proto import (TFTPproto,
+                        Errors,
+                        PacketTypes,
+                        file_block_size,
+                        parse_initial_packet,
+                        make_tftp_packet,
+                        parse_packet,
+                        parse_and_sanitize_filepath)
+from reactor import Reactor
 
 
 class DloadBlock(object):
@@ -326,226 +51,360 @@ class DloadBlock(object):
         self.boffset = boffset
         self.eoffset = eoffset
         self.servers = set()
+        self.idx = self.boffset // file_block_size
 
 
 class Server(object):
-    def __init__(self, addr, legacy=False):
+    ACTIVE = 0
+    OFFLINE = 1
+    ERROR = 2
+
+    def __init__(self, addr):
         self.addr = addr
-        self.legacy = legacy
-        self.last_ping_time = 0
-        self.files_info = {}
-        self.dload_count = 0
-        self.upload_count = 0
+        self.errors_in_row = 0
+        self.status = self.ACTIVE
+        self.last_ping_at = None
+        self.addr_s = "{}:{}".format(*self.addr)
+
+    def on_data(self):
+        self.errors_in_row = 0
+        self.last_ping_at = time.time()
 
 
 class FileInfo(object):
-    def __init__(self, size, awailable_blocks):
+    def __init__(self):
+        self.size = None
+        self.ready_blocks = []
+        self.fd = None
+        self.mmap = None
+
+    def get_fileobj(self):
+        if self.mmap is None:
+            return self.fd
+        return self.mmap
+
+    def close(self):
+        self.mmap.close()
+        self.fd.close()
+        self.fd = self.mmap = None
+
+    @classmethod
+    def open(cls, fname):
+        self = cls()
+        self.fd = open(fname, 'r+b')
+        self.fd.seek(0, os.SEEK_END)
+        self.size = self.fd.tell()
+        assert self.size <= TFTPServer.max_file_size
+        bsz = (self.size + file_block_size - 1) // file_block_size
+        self.ready_blocks = [True] * bsz
+        self.mmap = mmap.mmap(self.fd.fileno(), 0, prot=mmap.PROT_WRITE | mmap.PROT_READ)
+        return self
+
+    @classmethod
+    def create(cls, fname, size):
+        assert size <= TFTPServer.max_file_size
+        self = cls()
+        with open(fname, "wb") as fd:
+            fd.seek(size - 1)
+            fd.write("\x00")
+
+        self.fd = open(fname, "r+b")
         self.size = size
-        self.awailable_blocks = awailable_blocks
+        bsz = (size + file_block_size - 1) // file_block_size
+        self.ready_blocks = [False] * bsz
+        self.mmap = mmap.mmap(self.fd.fileno(), 0, prot=mmap.PROT_WRITE | mmap.PROT_READ)
+        return self
 
 
 class DLoad(object):
     NEW = 0
     IN_PROGRESS = 1
     DONE = 2
+    FAILED = 3
 
-    def __init__(self, fname):
+    def __init__(self, file_info, requested_file_name, target_file_name, tmp_file_name):
         self.status = self.NEW
         self.blocks = []
-        self.blocks_ready_to_load = []
-        # self.legacy_servers_q = None
+        self.blocks_ready_to_load = set()
+        self.servers_with_complete_file = set()
 
-        self.data_lenght = None
-        self.fname = None
-        self.fd = None
-        self.mmap = None
+        # set only when get file info
+        self.file_info = file_info
+        self.tmp_file_name = tmp_file_name
+        self.target_file_name = target_file_name
+        self.requested_file_name = requested_file_name
 
+    def __str__(self):
+        return "{0.__class__.__name__}({0.requested_file_name!r})".format(self)
 
-class CB(object):
-    def __init__(self, func, evt, fileobj, timeout_at):
-        self.func = func
-        self.evt = evt
-        self.fileobj = fileobj
-        self.timeout_at = timeout_at
-        self.fd = fileobj.fileno() if fileobj is not None else None
+    def __repr__(self):
+        return str(self)
 
 
-class Reactor(object):
-    def_recv_size = 1024
-
-    def __init__(self):
-        self.selector = select.epoll()
-
-        self.fd2cb = {}
-        self.callbacks_heap = []
-
-        self.selector.register(self.master_sock, select.POLLIN)
-        self.selector.register(self.control_sock, select.POLLIN)
-
-    def register(self, fileobj, evt, cb_func, timeout):
-        if timeout != -1:
-            timeout_at = int(timeout + time.time() * self.SECOND)
-        else:
-            timeout_at = None
-
-        cb = self.fd2cb.get(fileobj.fileno())
-        if not cb:
-            self.selector.register(fileobj, evt)
-            cb = CB(cb_func, evt, fileobj, timeout_at)
-            self.fd2cb[cb] = fileobj
-        else:
-            assert cb.fileobj is fileobj
-            assert cb.evt == evt
-            cb.func = cb_func
-            cb.timeout_at = timeout_at
-
-        if timeout_at is not None:
-            heapq.heappush(self.callbacks, (timeout_at, cb))
-
-    def unregister(self, fileobj):
-        self.selector.unregister(fileobj)
-        cb = self.fd2cb[fileobj.fileno()]
-        del self.fd2cb[fileobj.fileno()]
-        assert cb.tout_time is not None
-        cb.evt = cb.func = cb.fd = cb.fileobj = None
-        cb.timeout_at = 0
-
-    def call_later(self, tout, func):
-        call_at = int(tout + time.time() * self.SECOND)
-        cb = CB(func, None)
-        heapq.heappush(self.callbacks, (call_at, cb))
-
-    def serve_forever(self):
-        while True:
-            ctime = time.time()
-            while ctime >= self.callbacks[0][0]:
-                _, cb = heapq.heappop(self.callbacks)
-                if cb.func is None:
-                    continue
-                if cb.timeout_at > ctime:
-                    heapq.heapush(self.callbacks, (cb.timeout_at, cb))
-                else:
-                    if cb.fileobj is None:
-                        cb.func()
-                    else:
-                        cb.func(None, None)
-                    ctime = time.time()
-
-            wait_tout = self.callbacks[0][0] - time.time()
-            for fd, _ in self.selector.poll(wait_tout):
-                cb = self.fd2cb[fd]
-                data, remote_addr = cb.fileobj.recvfrom(self.def_recv_size)
-                cb.func(remote_addr, data)
+def get_my_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.connect(("gmail.com", 80))
+    return s.getsockname()[0]
 
 
 class TFTPServer(object):
-    file_block_size = 16 * 2 ** 20
     max_file_size = 1024 * file_block_size
 
     max_dload_count = 16
     max_updload_count = 16
 
     max_conn_per_server = 4
-    SECOND = 1000 * 1000
+    max_server_tout = 120
+    ping_timeout = 30
 
-    def __init__(self, root, bind_host, port=33348,
-                 control_sock_path="/tmp/tftp_control_sock", poll_tout=1000):
+    illegal_op_pkt = make_tftp_packet(PacketTypes.ERROR, *Errors.ILLEGAL_OPERATION)
+    internal_err_pkt = make_tftp_packet(PacketTypes.ERROR, *Errors.INTERNAL_ERROR)
+
+    def __init__(self, root, bind_host, port=33348, control_sock_path="/tmp/tftp_control_sock"):
         self.master_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.master_sock.bind((bind_host, port))
-        self.bind_host = bind_host
+        self.bind_addr = (bind_host, port)
+        self.control_sock_path = control_sock_path
         self.root = root
+
+        bind_host_ip = socket.gethostbyname(bind_host)
+        if bind_host_ip == '0.0.0.0' or bind_host_ip.startswith("127."):
+            self.my_addr = (get_my_ip(), port)
+        else:
+            self.my_addr = (bind_host_ip, port)
 
         self.dload_count = 0
         self.upload_count = 0
+        self.downloads = []
 
-        self.servers = []
-        # self.legacy_servers = []
+        self.files = {}  # name => FileInfo
+        self.servers = {}  # addr => Server
+        self.server_ping_queue = set()
 
         if os.path.exists(control_sock_path):
             os.unlink(control_sock_path)
-
-        # blacklist of broken/slow servers. heapq with remove timeout
-        self.servers_blist_heap = []
-        self.servers_blist = set()
 
         self.control_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         self.control_sock.bind(control_sock_path)
 
         self.reactor = Reactor()
         self.reactor.register(self.control_sock, select.POLLIN,
-                              self.on_control_msg, None)
+                              self.on_control_cmd, None)
         self.reactor.register(self.master_sock, select.POLLIN,
-                              self.on_master_sock, None)
+                              self.on_new_connection, None)
+        self.reactor.call_later(60, self.check_servers)
+        self.reactor.call_later(60, self.process_ping_queue)
 
-    def update_dload(self, dload):
-        if dload.status == DLoad.DONE:
+    def close(self):
+        self.reactor.close()
+
+        control_and_master_fds = (self.control_sock.fileno(), self.master_sock.fileno())
+        self.control_sock.close()
+        self.master_sock.close()
+        os.unlink(self.control_sock_path)
+
+        for fd in self.reactor.fd2cb:
+            if fd not in control_and_master_fds:
+                os.close(fd)
+
+    def on_new_connection(self, addr, data):
+        code, params = parse_initial_packet(data)
+        if code == PacketTypes.RRQ:
+            main_logger.debug("RRQ request: %r", params)
+
+            server = self.servers.get(addr)
+            data_cb = None if server is None else server.on_data
+
+            try:
+                conn = self.open_sock()
+            except Exception:
+                main_logger.exception("Can't open new socket")
+                return self.on_new_connection, None
+
+            try:
+                assert len(params) == 2
+                assert params[1] == 'octet'
+                path, boff, eoff = parse_and_sanitize_filepath(self.root, params[0])
+                if path not in self.files:
+                    finfo = FileInfo.open(path)
+                else:
+                    finfo = self.files[path]
+
+                _, callback, data = TFTPproto.create_send_file(finfo.get_fileobj(), boff, eoff,
+                                                               data_cb=data_cb)
+                conn.sendto(data, addr)
+                self.files[path] = finfo
+            except AssertionError:
+                main_logger.exception("Broken packet %r", data)
+                conn.sendto(self.illegal_op_pkt, addr)
+                conn.close()
+            except Exception:
+                main_logger.exception("During processing %r", data)
+                conn.sendto(self.internal_err_pkt, addr)
+                conn.close()
+            else:
+                self.reactor.register(conn, select.POLLIN, callback, TFTPproto.timeout)
+        elif code == PacketTypes.INFO:
+            main_logger.debug("INFO request: %r", params)
+            try:
+                assert len(params) == 2
+                fname, server_addrs = params
+                self.add_servers(server_addrs)
+                info = self.get_info(fname if fname != "" else None)
+                packet = make_tftp_packet(PacketTypes.INFO_ACK, params[0], *info)
+                main_logger.debug("%r <= %r", addr, packet)
+                self.master_sock.sendto(packet, addr)
+            except AssertionError:
+                main_logger.error("Broken packet %r", data)
+                self.master_sock.sendto(self.illegal_op_pkt, addr)
+            except Exception:
+                main_logger.exception("During processing %r", data)
+                self.master_sock.sendto(self.internal_err_pkt, addr)
+        elif code == PacketTypes.ERROR:
+            main_logger.warning("Unexpected ERROR request: %r", params)
+        else:
+            main_logger.warning("Unexpected request: %r %r", code, params)
+            self.master_sock.sendto(make_tftp_packet(*Errors.ILLEGAL_OPERATION), addr)
+        return self.on_new_connection, None
+
+    def add_servers(self, servers):
+        for addr in servers:
+            if addr not in self.servers and addr != self.my_addr:
+                srv = Server(addr)
+                self.enqueue_ping_server(srv)
+                self.servers[addr] = srv
+
+    def on_control_cmd(self, _, data):
+        cmd, params = data.split(" ", 1)
+        main_logger.info("New cmd: %r %r", cmd, params)
+        if cmd == 'servers':
+            srv_addrs = []
+            for srv_addr_s in params.split(" "):
+                ip, port_s = srv_addr_s.split(":")
+                srv_addrs.append((ip, int(port_s)))
+            self.add_servers(srv_addrs)
+        elif cmd == "dload":
+            self.start_dload(params)
+        else:
+            main_logger.error("Unknown cmd %r", cmd)
+        return self.on_control_cmd, None
+
+    def get_info(self, fname):
+        if fname is not None:
+            path, _, _ = parse_and_sanitize_filepath(self.root, fname)
+            if path in self.files:
+                finfo = self.files[path]
+                size = finfo.size
+                awail_blocks = finfo.ready_blocks[:]
+            elif os.path.isfile(path):
+                finfo = FileInfo.open(path)
+                self.files[path] = finfo
+                size = finfo.size
+                awail_blocks = finfo.ready_blocks[:]
+            else:
+                size = 0
+                awail_blocks = []
+        else:
+            size = awail_blocks = None
+
+        return size, awail_blocks, list(self.servers.keys()) + [self.my_addr]
+
+    def check_servers(self):
+        # ctime = time.time()
+
+        # for server in self.servers.values():
+        #     if server.last_ping_at is None:
+        #         self.ping_server(server)
+
+            # if ctime - server.last_ping_at > self.max_server_tout:
+            #     server.status = server.OFFLINE
+            # else:
+            # if ctime - server.last_ping_at > self.max_server_tout and server.status == server.OFFLINE:
+            #     server.status = server.ACTIVE
+            # if ctime - server.last_ping_at > self.ping_timeout:
+            #     self.ping_server(server)
+
+        self.reactor.call_later(60, self.check_servers)
+
+    def on_get_file_info_failed(self, dload, server, error):
+        server.errors_in_row += 1
+
+    def on_get_file_info_replay(self, dload, server, info):
+        main_logger.debug("Got responce for %r from server %r - %r", dload, server.addr_s, info)
+        fname, size, awail_blocks, new_server_addrs = info
+        self.add_servers(new_server_addrs)
+
+        if fname == "":
             return
 
-        # if dload.status == DLoad.NEW:
-        #     # if no NEW servers found
-        #     if dload.ready_to_load == []:
-        #         # try to start entire load from legacy server
-        #         if dload.legacy_servers_q is None:
-        #             dload.legacy_servers_q = self.legacy_servers
-        #         random.shuffle(dload.legacy_servers_q)
-        #         srv = dload.legacy_servers_q.pop()
-        #
-        #         # start entire dload. will then
-        #         results_cb = functools.partial(self.on_dload_complete,
-        #                                        dload, awail_block)
-        #         err_cb = functools.partial(self.on_block_dload_error,
-        #                                    dload, awail_block)
-        #         proto = self.add_proto(results_cb, err_cb)
-        #         self.new_proto_data(proto, proto.init_read, server.addr,
-        #                             rpath=dload.fname,
-        #                             boffset=awail_block,
-        #                             eoffset=awail_block + 1)
-        #
-        #         dload.status = dload.IN_PROGRESS
-        #         dload.dload_count += 1
+        if dload.status == dload.NEW:
+            dload.file_info = FileInfo.create(dload.tmp_file_name, size)
+            self.files[dload.target_file_name] = dload.file_info
 
-        if not dload.ready_to_load:
+        if all(awail_blocks):
+            dload.servers_with_complete_file.add(server)
+
+        dload.blocks = []
+        for pos, is_awail in enumerate(awail_blocks):
+            if dload.status == dload.NEW:
+                eoffset = min(size, (pos + 1) * file_block_size)
+                dload.blocks.append(DloadBlock(pos * file_block_size, eoffset))
+
+            if is_awail:
+                block = dload.blocks[pos]
+                block.servers.add(server)
+                dload.blocks_ready_to_load.add(block)
+
+        dload.status = dload.IN_PROGRESS
+        self.update_dload(dload)
+
+    def update_dload(self, dload):
+        if dload.status in (DLoad.DONE, DLoad.NEW):
+            return
+
+        if not dload.blocks_ready_to_load:
             for block in dload.blocks:
                 if not block.done:
-                    break
-        else:
+                    return
             # dload complete
             self.on_dload_complete(dload)
+            return
 
         free_slots = self.max_dload_count - self.dload_count
         if free_slots <= 0:
             return
 
-        # TODO(koder): randomize this
-        will_start = dload.ready_to_load[:free_slots]
-        dload.ready_to_load = dload.ready_to_load[free_slots:]
+        num_blocks = min(free_slots, len(dload.blocks_ready_to_load))
 
-        for awail_block in will_start:
-            assert awail_block.server is None
+        # TODO(koder): randomize this
+        for _ in range(num_blocks):
+            awail_block = dload.blocks_ready_to_load.pop()
+            assert awail_block.active_server is None
             assert awail_block.servers
             random.shuffle(awail_block.servers)
 
-            while len(awail_block.servers) > 0:
-                server = awail_block.servers[-1]
-                if server not in self.servers_blist:
+            while awail_block.servers:
+                server = awail_block.servers.pop()
+                if server.status == server.ACTIVE:
                     break
-                awail_block.servers.pop()
             else:
-                # will wait for new update
-                return
+                continue
 
-            results_cb = functools.partial(self.on_block_dload_complete,
-                                           dload, awail_block)
-            err_cb = functools.partial(self.on_block_dload_error,
-                                       dload, awail_block)
-            proto = self.add_proto(results_cb, err_cb)
-            self.new_proto_data(proto, proto.init_read, server.addr,
-                                rpath=dload.fname,
-                                boffset=awail_block,
-                                eoffset=awail_block + 1)
+            results_cb = functools.partial(self.on_block_dload_complete, dload, awail_block)
+            err_cb = functools.partial(self.on_block_dload_failed, dload, awail_block)
 
-            dload.status = dload.IN_PROGRESS
-            dload.dload_count += 1
+            conn = self.open_sock()
+            _, callback, data = TFTPproto.create_read_file(dload.requested_file_name,
+                                                           dload.file_info.get_fileobj(),
+                                                           awail_block.boffset,
+                                                           awail_block.eoffset,
+                                                           result_cb=results_cb,
+                                                           err_cb=err_cb,
+                                                           data_cb=server.on_data)
+            conn.sendto(data, server.addr)
+            self.reactor.register(conn, select.POLLIN, callback, TFTPproto.timeout)
+            self.dload_count += 1
+            awail_block.active_server = server
 
     def start_dload(self, params):
         if " " not in params:
@@ -553,116 +412,120 @@ class TFTPServer(object):
             return
 
         mode, path = params.split(" ", 1)
-        dload = DLoad(path, mode)
-        self.update_servers_status(dload)
-        self.reactor.call_later(self.SECOND, functools.partial(self.update_dload, dload))
-        self.reactor.call_later(self.MINUTE, functools.partial(self.on_dload_failed, dload))
-        self.downloads.append(dload)
+        main_logger.info("Start downloading %s mode=%s", path, mode)
 
-    def update_servers_status(self, dload):
-        if dload.status == DLoad.DONE:
+        if os.path.sep in path:
+            main_logger.error("Wrong file path %r", path)
             return
 
-        for server in self.servers:
-            ready_cb = functools.partial(self.on_get_file_info, dload, server.addr)
-            err_cb = functools.partial(self.on_get_file_info_failed, dload, server.addr)
-            proto = self.add_proto(ready_cb, err_cb)
-            self.new_proto_data(proto, proto.get_info, server.addr, dload.fname)
+        final_dst_path = os.path.join(self.root, path)
+        if path in self.files or os.path.isfile(final_dst_path):
+            main_logger.error("File %r already exists or in progress", path)
+            return
 
-        self.reactor.call_later(10 * self.SECOND, functools.partial(self.update_servers_status, dload))
-        self.reactor.call_later(self.SECOND, functools.partial(self.update_dload, dload))
+        assert path not in self.files
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tmpname = os.tempnam(self.root)
 
-    def add_proto(self, result_cb=None, error_cb=None):
-        fileobj = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        fileobj.bind((self.bind_host, 0))
-        return TFTPproto(fileobj, result_cb, error_cb)
+        dload = DLoad(None, path, final_dst_path, tmpname)
+        self.downloads.append(dload)
 
-    def on_new_connection(self, data, addr):
-        proto = self.add_proto()
-        self.new_proto_data(proto, proto.init_packet, addr, data)
-        return self.on_new_connection, None
+        self.update_download_servers_info(dload)
+        self.reactor.call_later(60, functools.partial(self.on_dload_failed_if_not_starts, dload))
 
-    def on_control_cmd(self, data, addr):
-        cmd, params = data.split(" ", 1)
-        main_logger.info("New cmd: %r %r", cmd, params)
-        if cmd == 'servers':
-            for addr_s in params.split(" "):
-                host, port = addr_s.split(":")
-        elif cmd == "dload":
-            self.start_dload(params)
-        else:
-            main_logger.error("Unknown cmd %r", cmd)
+    def on_server_ping_replay(self, server, info):
+        if server.addr not in self.servers:
+            self.servers[server.addr] = server
 
-    def new_proto_data(self, proto, callback, remote_addr, *args, **kwargs):
-        try:
-            next_cb, msg = callback(*args, **kwargs)
-        except Exception:
-            main_logger.exception("During call callback")
-            next_cb = msg = None
-            proto.close(True, None)
+        fname, _, _, new_server_addrs = info
+        assert fname == ""
+        self.add_servers(new_server_addrs)
 
-        if msg is not None:
-            proto.fileobj.sendto(msg, remote_addr)
+    def process_ping_queue(self):
+        self.reactor.call_later(60, self.process_ping_queue)
 
-        if next_cb is None:
-            self.reactor.unregister(proto.fileobj)
-            proto.fileobj.close()
-        else:
-            callback = functools.partial(self.new_proto_data, proto, next_cb)
-            self.reactor.register(proto.fileobj, select.POLLIN, callback, proto.timeout)
+    def enqueue_ping_server(self, server):
+        self.server_ping_queue.add(server)
 
-    def on_block_dload_complete(self, dload, block_num):
-        dload.dload_count += 1
-        block = dload.blocks[block_num]
+    def ping_server(self, server):
+        ready_cb = functools.partial(self.on_server_ping_replay, server)
+        conn = self.open_sock()
+        _, callback, data = TFTPproto.create_get_info(None,
+                                                      list(self.servers.keys()),
+                                                      result_cb=ready_cb,
+                                                      data_cb=server.on_data)
+        conn.sendto(data, server.addr)
+        self.reactor.register(conn, select.POLLIN, callback, TFTPproto.timeout)
+
+    def update_download_servers_info(self, dload):
+        if dload.status in (dload.DONE, dload.FAILED):
+            return
+
+        main_logger.debug("Updating servers stats for download %r", dload)
+        for server in self.servers.values():
+            if server in dload.servers_with_complete_file or server.status != server.ACTIVE:
+                continue
+
+            ready_cb = functools.partial(self.on_get_file_info_replay, dload, server)
+            err_cb = functools.partial(self.on_get_file_info_failed, dload, server)
+
+            conn = self.open_sock()
+            _, callback, data = TFTPproto.create_get_info(dload.requested_file_name,
+                                                          list(self.servers.keys()) + [self.my_addr],
+                                                          result_cb=ready_cb,
+                                                          err_cb=err_cb,
+                                                          data_cb=server.on_data)
+            conn.sendto(data, server.addr)
+            self.reactor.register(conn, select.POLLIN, callback, TFTPproto.timeout)
+
+        self.reactor.call_later(10, functools.partial(self.update_download_servers_info, dload))
+        self.reactor.call_later(1, functools.partial(self.update_dload, dload))
+
+    def open_sock(self):
+        conn = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        conn.bind((self.bind_addr[0], 0))
+        return conn
+
+    def on_block_dload_complete(self, dload, block, _):
+        self.dload_count -= 1
+        dload.file_info.ready_blocks[block.idx] = True
         block.done = True
         block.active_server = None
         block.servers.clear()
         self.update_dload(dload)
-        raise NotImplemented()
 
-    def on_block_dload_failed(self, dload, block_num):
-        block = dload.blocks[block_num]
-        # check server error count and error type
-        block.servers.remove(block.active_server)
+    def on_block_dload_failed(self, dload, block, _):
+        self.dload_count -= 1
+        block.active_server.errors_in_row += 1
         block.active_server = None
-        self.dload_me.add(block)
+        if block.servers:
+            dload.blocks_ready_to_load.add(block)
         self.update_dload(dload)
-        raise NotImplemented()
 
     def on_dload_complete(self, dload):
-        raise NotImplemented()
+        dload.status = dload.DONE
+        assert dload.blocks_ready_to_load == set(), "{!r} != set()".format(dload.blocks_ready_to_load)
+        assert all(dload.file_info.ready_blocks), ",".join(map(str, dload.file_info.ready_blocks))
+        os.rename(dload.tmp_file_name, dload.target_file_name)
+        dload.tmp_file_name = None
+        dload.file_info.close()
+        del self.files[dload.target_file_name]
+        main_logger.info("Download of file %r complete", dload.requested_file_name)
+        self.downloads.remove(dload)
 
-    def on_dload_failed(self, dload):
+    def on_dload_failed_if_not_starts(self, dload):
         if dload.status == DLoad.NEW:
+            main_logger.error("Download of file %r failed", dload.requested_file_name)
+            dload.status = dload.FAILED
+            self.downloads.remove(dload)
             return
-        raise NotImplemented()
-
-    def on_get_file_info_failed(self, dload, server_addr, error):
-        # check server error count
-        raise NotImplemented()
-
-    def on_get_file_info(self, dload, server, info):
-        dload.servers[server.addr] = (server, info)
-
-        if dload.size is None:
-            dload.size = info.size
-            bcount = info.size // self.file_block_size
-            if info.size % self.file_block_size != 0:
-                bcount += 1
-
-            dload.blocks = []
-            for i in range(bcount):
-                eoffset = min(info.size, (i + 1) * self.file_block_size)
-                dload.blocks.append(DloadBlock(i * self.file_block_size, eoffset))
-
-            self.dload_me = set(range(bcount))
-
-        for awail_block in info.awailable_blocks:
-            dload.blocks[awail_block].servers.add(server.addr)
-        raise NotImplemented()
 
     def serve_forever(self):
-        self.proto.serve_forever()
+        main_logger.info("Server start on %r, using %r folder, %r control sock",
+                         ":".join(map(str, self.bind_addr)), self.root, self.control_sock_path)
+
+        self.reactor.serve_forever()
 
 
 def main(argv):
@@ -683,15 +546,47 @@ def main(argv):
     srv_parser.add_argument('--ip', '-i', default='0.0.0.0')
     srv_parser.add_argument('-f', '--control-file', default=control_sock_default_path)
 
+    cli_parser = subparsers.add_parser('cli', help='send cmd from cli over proto')
+    cli_parser.set_defaults(action='cli')
+    cli_parser.add_argument('-t', '--timeout', type=int, default=1)
+    cli_parser.add_argument('ip')
+    cli_parser.add_argument('port', type=int)
+    cli_parser.add_argument('cmd', choices=['info'])
+    cli_parser.add_argument('params', nargs='*', default=[])
+
     opts = parser.parse_args(argv[1:])
 
     if opts.action == 'serve':
-        ml = TFTPServer(opts.folder, bind_host=opts.ip, port=opts.port,
-                        control_sock_path=opts.control_file)
-        return ml.serve_forever()
+        server = TFTPServer(opts.folder, bind_host=opts.ip, port=opts.port,
+                            control_sock_path=opts.control_file)
+        try:
+            return server.serve_forever()
+        except KeyboardInterrupt:
+            main_logger.info("Got keyaboard interrupt, exiting. Bye!")
+        finally:
+            server.close()
+
     elif opts.action == 'cmd':
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         sock.sendto(" ".join(opts.command), opts.control_file)
+    elif opts.action == 'cli':
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        cmd_id = {
+            'info': PacketTypes.INFO
+        }
+
+        if len(opts.params) == 0:
+            opts.params = [""]
+
+        pkt = make_tftp_packet(cmd_id[opts.cmd], *opts.params)
+        sock.sendto(pkt, (opts.ip, opts.port))
+        read, _, _ = select.select([sock], [], [], opts.timeout)
+
+        if len(read) == 0:
+            print("Timeout!")
+        else:
+            data = sock.recv(Reactor.def_recv_size)
+            print(parse_packet(data))
     else:
         assert False, "??????"
 
