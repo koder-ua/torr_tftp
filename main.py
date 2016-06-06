@@ -33,15 +33,16 @@ main_logger = make_console_logger('main')
 make_console_logger('reactor')
 
 
+# have to import all local modules after setting up loggers
 from tftp_proto import (TFTPproto,
                         Errors,
                         PacketTypes,
-                        file_block_size,
                         parse_initial_packet,
                         make_tftp_packet,
                         parse_packet,
                         parse_and_sanitize_filepath)
 from reactor import Reactor
+from hardcoded_settings import FILE_BLOCK_SIZE, MAX_FILE_SIZE, MAX_PACKET_SIZE
 
 
 class DloadBlock(object):
@@ -51,7 +52,7 @@ class DloadBlock(object):
         self.boffset = boffset
         self.eoffset = eoffset
         self.servers = set()
-        self.idx = self.boffset // file_block_size
+        self.idx = self.boffset // FILE_BLOCK_SIZE
 
 
 class Server(object):
@@ -94,23 +95,24 @@ class FileInfo(object):
         self.fd = open(fname, 'r+b')
         self.fd.seek(0, os.SEEK_END)
         self.size = self.fd.tell()
-        assert self.size <= TFTPServer.max_file_size
-        bsz = (self.size + file_block_size - 1) // file_block_size
+        assert self.size <= MAX_FILE_SIZE
+        bsz = (self.size + FILE_BLOCK_SIZE - 1) // FILE_BLOCK_SIZE
         self.ready_blocks = [True] * bsz
         self.mmap = mmap.mmap(self.fd.fileno(), 0, prot=mmap.PROT_WRITE | mmap.PROT_READ)
         return self
 
     @classmethod
     def create(cls, fname, size):
-        assert size <= TFTPServer.max_file_size
+        assert size <= MAX_FILE_SIZE
         self = cls()
+
         with open(fname, "wb") as fd:
             fd.seek(size - 1)
             fd.write("\x00")
 
         self.fd = open(fname, "r+b")
         self.size = size
-        bsz = (size + file_block_size - 1) // file_block_size
+        bsz = (size + FILE_BLOCK_SIZE - 1) // FILE_BLOCK_SIZE
         self.ready_blocks = [False] * bsz
         self.mmap = mmap.mmap(self.fd.fileno(), 0, prot=mmap.PROT_WRITE | mmap.PROT_READ)
         return self
@@ -142,14 +144,13 @@ class DLoad(object):
 
 
 def get_my_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.connect(("gmail.com", 80))
-    return s.getsockname()[0]
+    # TODO(koder): need other way to get an ip
+    conn = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    conn.connect(("gmail.com", 80))
+    return conn.getsockname()[0]
 
 
 class TFTPServer(object):
-    max_file_size = 1024 * file_block_size
-
     max_dload_count = 16
     max_updload_count = 16
 
@@ -327,6 +328,9 @@ class TFTPServer(object):
         self.reactor.call_later(60, self.check_servers)
 
     def on_get_file_info_failed(self, dload, server, error):
+        str(self)
+        str(dload)
+        str(error)
         server.errors_in_row += 1
 
     def on_get_file_info_replay(self, dload, server, info):
@@ -347,8 +351,8 @@ class TFTPServer(object):
         dload.blocks = []
         for pos, is_awail in enumerate(awail_blocks):
             if dload.status == dload.NEW:
-                eoffset = min(size, (pos + 1) * file_block_size)
-                dload.blocks.append(DloadBlock(pos * file_block_size, eoffset))
+                eoffset = min(size, (pos + 1) * FILE_BLOCK_SIZE)
+                dload.blocks.append(DloadBlock(pos * FILE_BLOCK_SIZE, eoffset))
 
             if is_awail:
                 block = dload.blocks[pos]
@@ -585,7 +589,7 @@ def main(argv):
         if len(read) == 0:
             print("Timeout!")
         else:
-            data = sock.recv(Reactor.def_recv_size)
+            data = sock.recv(MAX_PACKET_SIZE)
             print(parse_packet(data))
     else:
         assert False, "??????"

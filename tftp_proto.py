@@ -2,7 +2,8 @@ import os
 import struct
 import random
 import logging
-from reactor import Reactor
+from hardcoded_settings import FILE_BLOCK_SIZE, MAX_PACKET_SIZE
+
 
 proto_logger = logging.getLogger('proto')
 
@@ -44,9 +45,6 @@ def long2net(val):
     return struct.pack("!Q", val)
 
 
-file_block_size = 16 * 2 ** 20
-
-
 def parse_addrs(addrs_s):
     addrs = []
     if 0 != len(addrs_s):
@@ -85,7 +83,7 @@ def parse_packet(data):
         if len(fname) > 0:
             size = net2long(rest[:8])
 
-            blocks_in_file = (size + file_block_size - 1) // file_block_size
+            blocks_in_file = (size + FILE_BLOCK_SIZE - 1) // FILE_BLOCK_SIZE
 
             eidx = (blocks_in_file + 7) // 8
             awail_bytes = rest[8:8 + eidx]
@@ -106,8 +104,6 @@ def parse_packet(data):
 
 # INFO -> INFO;FILENAME\0
 # INFO_R -> INFO_R;FILENAME\0;SIZE_2b;BLOCKS;OTHER_IPS\0
-
-MAX_PACKET_SIZE = Reactor.def_recv_size
 
 
 def addrs_to_str(addrs, max_sz):
@@ -146,13 +142,13 @@ def make_tftp_packet(code, *params):
             res += "\x00"
 
         if addrs:
-            res += addrs_to_str(addrs,  MAX_PACKET_SIZE - len(res) - 2)
+            res += addrs_to_str(addrs, MAX_PACKET_SIZE - len(res) - 2)
         res += "\x00"
     elif code == PacketTypes.INFO:
         fname, addrs = params
         res += fname + "\x00"
         if addrs:
-            res += addrs_to_str(addrs,  MAX_PACKET_SIZE - len(res) - 2)
+            res += addrs_to_str(addrs, MAX_PACKET_SIZE - len(res) - 2)
         res += "\x00"
     else:
         for i in params:
