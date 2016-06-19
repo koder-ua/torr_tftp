@@ -351,3 +351,46 @@ class TFTPproto(object):
         res = make_tftp_packet(PacketTypes.ERROR, *Errors.ILLEGAL_OPERATION)
         self.close(True, Errors.ILLEGAL_OPERATION)
         return None, res
+
+
+# class FastTFTPProto(TFTPproto):
+#     recv_timeout = 1
+#     def __init__(self, *args, **kwargs):
+#         super(FastTFTPProto, self).__init__(*args, **kwargs)
+#         self.need_resend = set()
+#         self.activelly_sendin = False
+#         self.last_packet_send_at = None
+#
+#     def on_ack(self):
+#         code, params = parse_packet(packet)
+#         max_id, missed_ids = params
+#         self.need_resend.update(missed_ids)
+#
+#         return self.send_next_block_pipe, self.last_packet
+#
+#     def send_next_block_pipe(self):
+#         if self.need_resend:
+#             curr_send_pos = self.need_resend.pop()
+#         else:
+#             self.pos += 1
+#             curr_send_pos = self.pos
+#
+#         curr_offset = self.boffset + (curr_send_pos - 1) * self.transfer_block_size
+#         if curr_offset >= self.file_size:
+#             self.activelly_sendin = False
+#             self.last_packet_send_at = time.time()
+#             return None, None
+#
+#         if self.eoffset is not None:
+#             rsize = max(0, min(self.transfer_block_size, self.eoffset - curr_offset))
+#         else:
+#             rsize = self.transfer_block_size
+#
+#         if 0 != rsize:
+#             self.fileobj.seek(curr_offset)
+#             data = self.fileobj.read(rsize)
+#         else:
+#             data = ""
+#
+#         self.last_packet = make_tftp_packet(PacketTypes.DATA, curr_send_pos, data)
+#         return self.send_next_block_pipe, self.last_packet

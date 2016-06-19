@@ -15,7 +15,7 @@ class CB(object):
         self.evt = evt
         self.fileobj = fileobj
         self.timeout_at = timeout_at
-        self.fd = fileobj.fileno() if fileobj is not None else None
+        self.fd = None if fileobj is None else fileobj.fileno()
 
 
 class Reactor(object):
@@ -73,6 +73,9 @@ class Reactor(object):
         call_at = tout + time.time()
         callback = CB(func, None, None, call_at)
         heapq.heappush(self.callbacks_heap, (call_at, callback))
+
+    def call_shortly(self, func):
+        self.call_later(-1, func)
 
     def serve_forever(self):
         while True:

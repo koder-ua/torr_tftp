@@ -104,17 +104,13 @@ class FileInfo(object):
     @classmethod
     def create(cls, fname, size):
         assert size <= MAX_FILE_SIZE
-        self = cls()
 
         with open(fname, "wb") as fd:
             fd.seek(size - 1)
             fd.write("\x00")
 
-        self.fd = open(fname, "r+b")
-        self.size = size
-        bsz = (size + FILE_BLOCK_SIZE - 1) // FILE_BLOCK_SIZE
-        self.ready_blocks = [False] * bsz
-        self.mmap = mmap.mmap(self.fd.fileno(), 0, prot=mmap.PROT_WRITE | mmap.PROT_READ)
+        self = cls.open(fname)
+        self.ready_blocks = [False] * len(self.ready_blocks)
         return self
 
 
