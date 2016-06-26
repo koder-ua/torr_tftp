@@ -4,7 +4,7 @@ import ("os"
         "github.com/op/go-logging")
 
 
-var log = logging.MustGetLogger("tftp")
+var log = logging.MustGetLogger("tsync")
 
 func main() {
     stdout_backend := logging.NewLogBackend(os.Stdout, "", 0)
